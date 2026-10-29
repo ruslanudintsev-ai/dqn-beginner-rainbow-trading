@@ -1,0 +1,7 @@
+torch
+gymnasium[classic-control]
+numpy
+pandas
+pandas-ta
+matplotlib
+tqdm
