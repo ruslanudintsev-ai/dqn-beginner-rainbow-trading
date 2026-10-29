@@ -1,0 +1,218 @@
+Вот **готовый шаблон** торговой среды Gymnasium для Forex (EURUSD), адаптированный под дискретные действия (hold / long / short) и совместимый с Rainbow DQN.
+
+Он использует:
+- Окно последних баров + несколько популярных индикаторов (через `pandas_ta`)
+- Логарифмическую доходность в награде
+- Учёт спреда и фиксированной комиссии
+- Простую позицию (0 или ±1 лот)
+
+```python
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+from typing import Optional, Tuple, Dict, Any
+
+class ForexTradingEnv(gym.Env):
+    """
+    Простая среда для торговли EURUSD (или любой парой).
+    Действия: 0 = hold, 1 = long (buy), 2 = short (sell)
+    Награда: изменение логарифма эквити (с учётом спреда и комиссии)
+    """
+    metadata = {"render_modes": ["human"], "render_fps": 4}
+
+    def __init__(
+        self,
+        df: pd.DataFrame,                    # OHLCV DataFrame с колонками ['open','high','low','close','volume']
+        window_size: int = 64,               # размер окна наблюдения
+        spread_pips: float = 1.2,            # спред в пунктах (для 5-значных котировок → 0.00012)
+        commission: float = 0.00003,         # комиссия за сделку (0.003% например)
+        initial_balance: float = 10000.0,
+        lot_size: float = 100000.0,          # стандартный лот
+        max_position: float = 1.0,           # максимальный объём позиции (в лотах)
+        fee_on_open_close: bool = True,      # комиссия при открытии и закрытии
+    ):
+        super().__init__()
+
+        # Проверяем и готовим данные
+        required_cols = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            raise ValueError("DataFrame должен содержать 'open', 'high', 'low', 'close'")
+        self.df = df.reset_index(drop=True).copy()
+        self.df['volume'] = self.df.get('volume', 0)  # если нет volume → 0
+
+        # Добавляем индикаторы (можно расширить)
+        self.df['rsi']    = ta.rsi(self.df['close'], length=14)
+        self.df['macd']   = ta.macd(self.df['close'])['MACD_12_26_9']
+        self.df['macd_s'] = ta.macd(self.df['close'])['MACDs_12_26_9']
+        self.df['atr']    = ta.atr(self.df['high'], self.df['low'], self.df['close'], length=14)
+        self.df['bb_upper'], self.df['bb_middle'], self.df['bb_lower'] = ta.bbands(self.df['close'], length=20).iloc[:, :3].T.values
+
+        # Удаляем NaN (первые строки индикаторов)
+        self.df = self.df.dropna().reset_index(drop=True)
+
+        if len(self.df) < window_size + 10:
+            raise ValueError("Слишком мало данных после добавления индикаторов")
+
+        self.window_size = window_size
+        self.spread = spread_pips * 0.0001          # для 5-значных котировок
+        self.commission = commission
+        self.initial_balance = initial_balance
+        self.lot_size = lot_size
+        self.max_position = max_position
+        self.fee_on_open_close = fee_on_open_close
+
+        # Пространства
+        # Действия: 0=hold, 1=buy/long, 2=sell/short
+        self.action_space = spaces.Discrete(3)
+
+        # Наблюдение: окно + текущая позиция + баланс/equity
+        features = ['close', 'rsi', 'macd', 'macd_s', 'atr', 'bb_upper', 'bb_middle', 'bb_lower']  # 8 фич + delta close
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(window_size * len(features) + 3,), dtype=np.float32
+        )  # + position, balance_norm, equity_norm
+
+        # Состояние агента
+        self.current_step = 0
+        self.balance = initial_balance
+        self.equity = initial_balance
+        self.position = 0.0          # +1 long, -1 short, 0 flat
+        self.entry_price = 0.0
+        self.max_equity = initial_balance
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[Dict] = None,
+    ) -> Tuple[np.ndarray, Dict]:
+        super().reset(seed=seed)
+
+        self.current_step = self.window_size
+        self.balance = self.initial_balance
+        self.equity = self.initial_balance
+        self.position = 0.0
+        self.entry_price = 0.0
+        self.max_equity = self.initial_balance
+
+        obs = self._get_observation()
+        info = self._get_info()
+
+        return obs, info
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        current_price = self.df.iloc[self.current_step]['close']
+        prev_equity = self.equity
+
+        # Закрываем старую позицию, если меняем направление
+        if action == 1 and self.position < 0:   # был short → закрываем и открываем long
+            self._close_position(current_price)
+        elif action == 2 and self.position > 0: # был long → закрываем и открываем short
+            self._close_position(current_price)
+
+        # Открываем новую позицию, если нужно
+        if action == 1 and self.position == 0:
+            self._open_position(current_price, direction=1.0)
+        elif action == 2 and self.position == 0:
+            self._open_position(current_price, direction=-1.0)
+
+        # Обновляем equity (mark-to-market)
+        if self.position != 0:
+            profit = self.position * (current_price - self.entry_price) * self.lot_size
+            self.equity = self.balance + profit
+        else:
+            self.equity = self.balance
+
+        # Награда = log-return (сглаживает экспоненциальный рост)
+        reward = np.log(self.equity / prev_equity + 1e-9) if prev_equity > 0 else 0.0
+
+        # Штраф за большие просадки (опционально)
+        drawdown = (self.max_equity - self.equity) / self.max_equity
+        if drawdown > 0.1:
+            reward -= drawdown * 0.5
+
+        self.max_equity = max(self.max_equity, self.equity)
+
+        self.current_step += 1
+        terminated = self.current_step >= len(self.df) - 1
+        truncated = False  # или по максимальному времени
+
+        obs = self._get_observation()
+        info = self._get_info()
+
+        return obs, reward, terminated, truncated, info
+
+    def _open_position(self, price: float, direction: float):
+        cost = self.commission * self.lot_size * self.max_position if self.fee_on_open_close else 0
+        self.balance -= cost
+        self.position = direction * self.max_position
+        self.entry_price = price + (self.spread / 2 if direction > 0 else -self.spread / 2)
+
+    def _close_position(self, price: float):
+        if self.position == 0:
+            return
+        profit = self.position * (price - self.entry_price) * self.lot_size
+        cost = self.commission * self.lot_size * abs(self.position) if self.fee_on_open_close else 0
+        self.balance += profit - cost
+        self.position = 0.0
+        self.entry_price = 0.0
+
+    def _get_observation(self) -> np.ndarray:
+        start = self.current_step - self.window_size
+        end = self.current_step
+        window = self.df.iloc[start:end]
+
+        features = window[['close', 'rsi', 'macd', 'macd_s', 'atr', 'bb_upper', 'bb_middle', 'bb_lower']].values
+        flat = features.flatten().astype(np.float32)
+
+        # Нормализуем последние цены относительно текущей
+        close_norm = window['close'].values / window['close'].iloc[-1] - 1.0
+
+        pos_norm = self.position  # уже -1..1
+        balance_norm = (self.balance - self.initial_balance) / self.initial_balance
+        equity_norm = (self.equity - self.initial_balance) / self.initial_balance
+
+        obs = np.concatenate([flat, [pos_norm, balance_norm, equity_norm]])
+        return obs
+
+    def _get_info(self) -> Dict[str, Any]:
+        return {
+            "balance": self.balance,
+            "equity": self.equity,
+            "position": self.position,
+            "step": self.current_step,
+        }
+
+    def render(self, mode="human"):
+        if mode == "human":
+            print(f"Step: {self.current_step} | Equity: {self.equity:.2f} | Pos: {self.position:.2f}")
+
+# Пример использования
+if __name__ == "__main__":
+    # Загрузи свои данные (H1 EURUSD, например)
+    df = pd.read_csv("EURUSD_H1_2015_2024.csv", parse_dates=['time'])
+    df = df[['time','open','high','low','close','volume']].rename(columns={'time':'index'})
+
+    env = ForexTradingEnv(df, window_size=64, spread_pips=1.0, commission=0.00002)
+
+    obs, _ = env.reset()
+    print("Observation shape:", obs.shape)
+
+    for _ in range(200):
+        action = env.action_space.sample()  # или твой агент
+        obs, reward, terminated, truncated, info = env.step(action)
+        env.render()
+        if terminated or truncated:
+            break
+```
+
+### Что можно улучшить дальше
+- Добавить trailing stop / take profit / stop loss (как часть действий или авто)
+- Множественные таймфреймы (M15 + H1 признаки)
+- Нормализация фич (rolling scaler)
+- Slippage / latency моделирование
+- Walk-forward валидация (разделить df на train/test)
+
+Если хочешь — могу доработать под конкретные индикаторы, добавить multi-lot действия или интегрировать с твоим Rainbow кодом из Curt-Park.
+
+Готов дальше? Что правим/добавляем первым?

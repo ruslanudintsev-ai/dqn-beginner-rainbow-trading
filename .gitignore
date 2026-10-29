@@ -1,0 +1,9 @@
+# local environments
+.conda/
+.venv/
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
